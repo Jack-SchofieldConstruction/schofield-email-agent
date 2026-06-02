@@ -24,7 +24,7 @@ import json
 import email
 import imaplib
 from email.header import decode_header
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
 
 import anthropic
@@ -44,7 +44,8 @@ SUPABASE_URL     = os.environ["SUPABASE_URL"].rstrip("/")
 SUPABASE_KEY     = os.environ["SUPABASE_KEY"]
 PORTAL_ORIGIN    = os.environ.get("PORTAL_ORIGIN", "*")
 
-MAX_EMAILS_PER_SCAN = 25  # cap to keep API costs predictable per scan
+MAX_EMAILS_PER_SCAN = 200  # cap to keep one scan bounded; dedup means re-scans are cheap
+SCAN_DAYS_BACK = int(os.environ.get("SCAN_DAYS_BACK", "90"))
 CLASSIFY_MODEL = "claude-haiku-4-5-20251001"
 
 app = Flask(__name__)
@@ -202,30 +203,32 @@ def strip_html(html):
     return text.strip()
 
 
-def fetch_unread_emails():
-    """Return list of dicts for all UNREAD emails in INBOX (capped at MAX_EMAILS_PER_SCAN, newest first).
+def fetch_recent_emails():
+    """Fetch all emails from INBOX received in the last SCAN_DAYS_BACK days.
 
-    We don't mark them as read — the user's inbox read/unread state stays under their control.
-    Deduplication against re-processing is handled by Message-ID in Supabase.
+    Dedup happens later via Message-ID lookup against Supabase, so re-running this
+    repeatedly is cheap — only never-seen emails get sent to Claude for classification.
+    BODY.PEEK ensures we don't change the read/unread state.
     """
     mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
     mail.login(IMAP_USER, IMAP_PASSWORD)
     mail.select("INBOX")
 
-    # UNSEEN = unread. Use PEEK in the fetch so we don't accidentally mark as read.
-    status, data = mail.search(None, "UNSEEN")
+    # IMAP SINCE wants a date like "01-Jan-2026" — gives us all emails ON or AFTER that day.
+    since_dt = datetime.now(timezone.utc) - timedelta(days=SCAN_DAYS_BACK)
+    since_str = since_dt.strftime("%d-%b-%Y")
+    status, data = mail.search(None, f'(SINCE "{since_str}")')
     if status != "OK":
         mail.logout()
         return []
 
     ids = data[0].split()
-    # Most recent first; cap how many we look at
+    # Newest first; cap how many we look at in a single scan
     ids = list(reversed(ids))[:MAX_EMAILS_PER_SCAN]
 
     emails = []
-
     for msg_id in ids:
-        # BODY.PEEK[] reads the message WITHOUT setting the \Seen flag
+        # PEEK so we don't mark as read
         status, msg_data = mail.fetch(msg_id, "(BODY.PEEK[])")
         if status != "OK":
             continue
@@ -243,17 +246,14 @@ def fetch_unread_emails():
         message_id_hdr = msg.get("Message-ID") or msg.get("Message-Id") or f"no-id-{msg_id.decode()}"
         from_hdr = decode_value(msg.get("From", ""))
         subject  = decode_value(msg.get("Subject", ""))
-        body     = extract_body(msg)
-
-        # Parse "Name <addr@example.com>"
-        from_name, from_addr = email.utils.parseaddr(from_hdr)
 
         emails.append({
             "message_id":  message_id_hdr.strip(),
-            "from_addr":   from_addr.lower().strip(),
-            "from_name":   decode_value(from_name).strip(),
+            "from_addr":   "",      # filled in later if we proceed past dedup
+            "from_name":   "",
+            "from_hdr":    from_hdr,
             "subject":     subject.strip(),
-            "body":        body[:4000],   # cap body length for token costs
+            "msg":         msg,     # keep the parsed message so we only extract the body if needed
             "received":    received_dt.isoformat(),
         })
 
@@ -378,25 +378,37 @@ def scan():
     scan_started_at = datetime.now(timezone.utc).isoformat()
 
     try:
-        emails = fetch_unread_emails()
+        emails = fetch_recent_emails()
     except Exception as e:
         app.logger.exception("IMAP fetch failed")
         return jsonify({"error": f"Could not fetch mail: {e}"}), 500
 
     new_enquiries = []
     new_contacts  = []
+    skipped_dupes = 0
+    classified    = 0
 
     for em in emails:
+        # Cheap path: skip anything already in the DB BEFORE parsing body or calling Claude
         if enquiry_exists(em["message_id"]):
+            skipped_dupes += 1
             continue
 
+        # Only now do the expensive body extraction and parsing
+        msg = em.pop("msg")
+        body = extract_body(msg)[:4000]
+        from_name, from_addr = email.utils.parseaddr(em["from_hdr"])
+        em["from_addr"] = from_addr.lower().strip()
+        em["from_name"] = decode_value(from_name).strip()
+        em["body"]      = body
+
         cls = classify_email(em)
+        classified += 1
         if not cls or not cls.get("is_enquiry"):
             continue
 
         role = cls.get("role")
 
-        # Insert enquiry
         enq_row = {
             "outlook_message_id": em["message_id"],
             "received_date": em["received"],
@@ -413,9 +425,8 @@ def scan():
         }
         inserted = sb_insert("enquiries", enq_row)
         if not inserted:
-            continue  # dedupe
+            continue
 
-        # Portal-shape row for the immediate response
         new_enquiries.append({
             "date":     em["received"][:16].replace("T", " "),
             "from":     enq_row["from_name"],
@@ -428,7 +439,6 @@ def scan():
             "priority": enq_row["priority"],
         })
 
-        # Insert contact if new
         if em["from_addr"] and not contact_exists(em["from_addr"]):
             contact_row = {
                 "name":    cls.get("from_name") or em["from_name"] or em["from_addr"],
@@ -445,7 +455,6 @@ def scan():
                     "phone":   contact_row["phone"],
                 })
 
-    # Update the cursor for the UI's "last scanned" display
     set_last_scan(scan_started_at)
 
     return jsonify({
@@ -453,6 +462,8 @@ def scan():
         "contacts":        new_contacts,
         "scanCompletedAt": scan_started_at,
         "scannedCount":    len(emails),
+        "newlyClassified": classified,
+        "skippedDuplicates": skipped_dupes,
     })
 
 
