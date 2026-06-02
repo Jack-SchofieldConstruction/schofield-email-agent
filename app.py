@@ -256,7 +256,7 @@ def fetch_emails_since(since_iso):
 # -----------------------------------------------------------------------------
 # Claude classification
 # -----------------------------------------------------------------------------
-CLASSIFY_PROMPT = """You classify inbound business emails for Schofield Construction, a UK groundworks/construction business that also provides health & safety compliance documentation. The owner takes on both project work (builds, refurbs, civils, paving, fencing) and freelance/contract roles (PM, QS, site management, day-rate cover).
+CLASSIFY_PROMPT_TEMPLATE = """You classify inbound business emails for Schofield Construction, a UK groundworks/construction business that also provides health & safety compliance documentation. The owner takes on both project work (builds, refurbs, civils, paving, fencing) and freelance/contract roles (PM, QS, site management, day-rate cover).
 
 Return ONLY valid JSON (no markdown fences, no prose) matching this shape exactly:
 
@@ -279,20 +279,19 @@ Rules:
 - from_name and company: extract from the email signature or sender field. Use empty string if unknowable.
 
 EMAIL:
-From: {from_field}
-Subject: {subject}
+From: __FROM_FIELD__
+Subject: __SUBJECT__
 
 Body:
-{body}
+__BODY__
 """
 
 
 def classify_email(em):
-    prompt = CLASSIFY_PROMPT.format(
-        from_field=f"{em['from_name']} <{em['from_addr']}>",
-        subject=em["subject"],
-        body=em["body"] or "(empty body)",
-    )
+    prompt = (CLASSIFY_PROMPT_TEMPLATE
+              .replace("__FROM_FIELD__", f"{em['from_name']} <{em['from_addr']}>")
+              .replace("__SUBJECT__", em["subject"])
+              .replace("__BODY__", em["body"] or "(empty body)"))
     try:
         resp = anthropic_client.messages.create(
             model=CLASSIFY_MODEL,
