@@ -76,14 +76,28 @@ def sb_select(table, params=None):
 
 
 def sb_insert(table, row):
+    # Drop any keys with None values to avoid unknown-column errors if the schema
+    # doesn't yet have an optional column (e.g. before DB migration runs)
+    clean_row = {k: v for k, v in row.items() if v is not None}
     r = requests.post(
         f"{SUPABASE_URL}/rest/v1/{table}",
         headers=_sb_headers(),
-        json=row,
+        json=clean_row,
         timeout=15,
     )
     if r.status_code == 409:  # unique violation — already exists, skip silently
         return None
+    if r.status_code == 400 and "role" in r.text.lower():
+        # Column doesn't exist yet — retry without it
+        clean_row.pop("role", None)
+        r = requests.post(
+            f"{SUPABASE_URL}/rest/v1/{table}",
+            headers=_sb_headers(),
+            json=clean_row,
+            timeout=15,
+        )
+        if r.status_code == 409:
+            return None
     r.raise_for_status()
     data = r.json()
     return data[0] if isinstance(data, list) and data else data
@@ -188,19 +202,18 @@ def strip_html(html):
     return text.strip()
 
 
-def fetch_emails_since(since_iso):
-    """Return list of dicts: {message_id, from_addr, from_name, subject, body, received}."""
+def fetch_unread_emails():
+    """Return list of dicts for all UNREAD emails in INBOX (capped at MAX_EMAILS_PER_SCAN, newest first).
+
+    We don't mark them as read — the user's inbox read/unread state stays under their control.
+    Deduplication against re-processing is handled by Message-ID in Supabase.
+    """
     mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
     mail.login(IMAP_USER, IMAP_PASSWORD)
     mail.select("INBOX")
 
-    if since_iso:
-        since_dt = datetime.fromisoformat(since_iso.replace("Z", "+00:00"))
-        since_str = since_dt.strftime("%d-%b-%Y")
-        status, data = mail.search(None, f'(SINCE "{since_str}")')
-    else:
-        status, data = mail.search(None, "ALL")
-
+    # UNSEEN = unread. Use PEEK in the fetch so we don't accidentally mark as read.
+    status, data = mail.search(None, "UNSEEN")
     if status != "OK":
         mail.logout()
         return []
@@ -210,18 +223,15 @@ def fetch_emails_since(since_iso):
     ids = list(reversed(ids))[:MAX_EMAILS_PER_SCAN]
 
     emails = []
-    cutoff_dt = None
-    if since_iso:
-        cutoff_dt = datetime.fromisoformat(since_iso.replace("Z", "+00:00"))
 
     for msg_id in ids:
-        status, msg_data = mail.fetch(msg_id, "(RFC822)")
+        # BODY.PEEK[] reads the message WITHOUT setting the \Seen flag
+        status, msg_data = mail.fetch(msg_id, "(BODY.PEEK[])")
         if status != "OK":
             continue
         raw = msg_data[0][1]
         msg = email.message_from_bytes(raw)
 
-        # IMAP SINCE is date-only, so filter again with the precise time
         received_raw = msg.get("Date")
         try:
             received_dt = parsedate_to_datetime(received_raw)
@@ -229,8 +239,6 @@ def fetch_emails_since(since_iso):
             received_dt = datetime.now(timezone.utc)
         if received_dt.tzinfo is None:
             received_dt = received_dt.replace(tzinfo=timezone.utc)
-        if cutoff_dt and received_dt <= cutoff_dt:
-            continue
 
         message_id_hdr = msg.get("Message-ID") or msg.get("Message-Id") or f"no-id-{msg_id.decode()}"
         from_hdr = decode_value(msg.get("From", ""))
@@ -256,13 +264,19 @@ def fetch_emails_since(since_iso):
 # -----------------------------------------------------------------------------
 # Claude classification
 # -----------------------------------------------------------------------------
-CLASSIFY_PROMPT_TEMPLATE = """You classify inbound business emails for Schofield Construction, a UK groundworks/construction business that also provides health & safety compliance documentation. The owner takes on both project work (builds, refurbs, civils, paving, fencing) and freelance/contract roles (PM, QS, site management, day-rate cover).
+CLASSIFY_PROMPT_TEMPLATE = """You classify inbound business emails for Jack at Schofield Construction.
+
+About Jack's situation:
+- He is PRIMARILY looking for freelance/contract opportunities for himself: Site Manager, Project Manager, and Quantity Surveyor roles, plus day-rate cover work.
+- He also receives some project enquiries for Schofield Construction (groundworks, civils, paving, fencing, small builds).
+- Recruiter cold-emails about specific freelance/contract roles ARE valid enquiries — they're a primary lead source.
 
 Return ONLY valid JSON (no markdown fences, no prose) matching this shape exactly:
 
 {
   "is_enquiry": boolean,
   "type": "project" | "freelance" | null,
+  "role": "site_manager" | "project_manager" | "quantity_surveyor" | "other" | null,
   "priority": "hot" | "warm" | "cold" | null,
   "estimated_value_gbp": number | null,
   "summary": string,
@@ -270,13 +284,45 @@ Return ONLY valid JSON (no markdown fences, no prose) matching this shape exactl
   "company": string
 }
 
-Rules:
-- is_enquiry=true ONLY when the sender is asking about work, a quote, a contract role, a job opportunity, or a project. Newsletters, marketing emails, receipts, internal admin, personal mail, automated notifications, and HMRC/bank/insurance mail are NOT enquiries.
-- type="project" for construction project work (builds, refurbs, civils, groundworks, paving, fencing, JV opportunities). type="freelance" for contract roles, day-rate work, recruiter approaches, PM/QS/site manager cover.
-- priority="hot" if explicitly urgent, named decision-maker, or clearly high-value. "cold" if vague/exploratory/spammy. "warm" otherwise.
-- estimated_value_gbp: extract if explicitly stated; else best estimate from scope; else null. Use sensible UK construction figures.
-- summary: one sentence, under 20 words, plain English.
-- from_name and company: extract from the email signature or sender field. Use empty string if unknowable.
+Classification rules:
+
+is_enquiry = TRUE when:
+- A recruiter is offering Jack a specific contract/freelance role (Site Manager, Project Manager, QS, or similar construction freelance work). Even if generic/cold, treat as TRUE.
+- Someone is asking about project work for Schofield Construction (quotes, builds, civils, groundworks).
+- Someone is offering a day-rate or short-term contract opportunity.
+- Anyone asking about Jack's availability for site management, project management, or QS work.
+
+is_enquiry = FALSE when:
+- Newsletters, marketing blasts, industry news, job-board digests (e.g. "10 new jobs matching your search").
+- Receipts, invoices, billing, HMRC, banks, insurance.
+- Automated notifications (LinkedIn updates, software notifications, calendar invites).
+- Personal mail, internal admin, replies to existing threads from known contacts already in Jack's pipeline.
+- Recruiter spam that is NOT for construction freelance roles (e.g. tech jobs, sales jobs, anything outside SM/PM/QS/site work).
+
+type:
+- "freelance" — contract or day-rate role for Jack personally (SM, PM, QS, site cover, etc.). This is the MAJORITY case.
+- "project" — work for Schofield Construction (groundworks, builds, civils, etc.).
+
+role (only relevant when type = "freelance"):
+- "site_manager" — site management or SM role
+- "project_manager" — PM, project lead, or similar
+- "quantity_surveyor" — QS, commercial manager, estimating
+- "other" — freelance but doesn't fit the above (e.g. day rate labourer cover)
+- null — when type is "project"
+
+priority:
+- "hot" — named decision-maker, specific role with start date, explicit day rate or value, urgent timing, OR matches Jack's specialism (SM/PM/QS) closely.
+- "warm" — relevant but generic/early-stage.
+- "cold" — vague, exploratory, weak fit.
+
+estimated_value_gbp:
+- For freelance: estimate total contract value if duration mentioned (e.g. "£500/day x 12 weeks = ~£30,000"). Use UK day rates: SM £350-500, PM £400-600, QS £400-550.
+- For projects: best estimate from scope.
+- null if genuinely unknowable.
+
+summary: one sentence, under 20 words, plain English. State the role/type and key detail (location, duration, rate if known).
+
+from_name and company: extract from signature or sender. Empty string if unknowable.
 
 EMAIL:
 From: __FROM_FIELD__
@@ -329,13 +375,10 @@ def scan():
     if request.method == "OPTIONS":
         return ("", 204)
 
-    payload = request.get_json(silent=True) or {}
-    # Portal sends { since: ISO_string }. If absent, fall back to DB value.
-    since = payload.get("since") or get_last_scan()
     scan_started_at = datetime.now(timezone.utc).isoformat()
 
     try:
-        emails = fetch_emails_since(since)
+        emails = fetch_unread_emails()
     except Exception as e:
         app.logger.exception("IMAP fetch failed")
         return jsonify({"error": f"Could not fetch mail: {e}"}), 500
@@ -351,6 +394,8 @@ def scan():
         if not cls or not cls.get("is_enquiry"):
             continue
 
+        role = cls.get("role")
+
         # Insert enquiry
         enq_row = {
             "outlook_message_id": em["message_id"],
@@ -361,6 +406,7 @@ def scan():
             "subject":    em["subject"],
             "summary":    cls.get("summary") or "",
             "type":       cls.get("type"),
+            "role":       role,
             "stage":      "lead",
             "estimated_value": cls.get("estimated_value_gbp") or 0,
             "priority":   cls.get("priority") or "warm",
@@ -375,7 +421,8 @@ def scan():
             "from":     enq_row["from_name"],
             "company":  enq_row["company"],
             "subject":  enq_row["subject"],
-            "type":     enq_row["type"] or "project",
+            "type":     enq_row["type"] or "freelance",
+            "role":     role,
             "stage":    enq_row["stage"],
             "value":    enq_row["estimated_value"],
             "priority": enq_row["priority"],
@@ -398,7 +445,7 @@ def scan():
                     "phone":   contact_row["phone"],
                 })
 
-    # Advance the cursor — even if zero new enquiries, we don't want to re-scan these
+    # Update the cursor for the UI's "last scanned" display
     set_last_scan(scan_started_at)
 
     return jsonify({
