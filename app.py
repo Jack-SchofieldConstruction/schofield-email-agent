@@ -1,0 +1,415 @@
+"""
+Schofield Construction email agent.
+
+Single-file Flask service:
+  POST /scan     -> reads new mail from Hostinger IMAP, classifies via Claude,
+                    writes enquiries + contacts to Supabase, returns JSON
+                    in the shape the portal expects.
+  GET  /health   -> sanity check
+  GET  /         -> simple "hello" so the Render URL doesn't 404
+
+Required environment variables (set in Render dashboard, NOT in code):
+  IMAP_HOST       e.g. imap.hostinger.com
+  IMAP_PORT       typically 993
+  IMAP_USER       e.g. info@schofieldconstruction.site
+  IMAP_PASSWORD   your email or app password
+  ANTHROPIC_API_KEY
+  SUPABASE_URL    e.g. https://xxxxx.supabase.co
+  SUPABASE_KEY    the service_role key
+  PORTAL_ORIGIN   e.g. https://schofieldgroundworks.co.uk (for CORS)
+"""
+
+import os
+import json
+import email
+import imaplib
+from email.header import decode_header
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+
+import anthropic
+import requests
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+
+# -----------------------------------------------------------------------------
+# Config
+# -----------------------------------------------------------------------------
+IMAP_HOST        = os.environ.get("IMAP_HOST", "imap.hostinger.com")
+IMAP_PORT        = int(os.environ.get("IMAP_PORT", "993"))
+IMAP_USER        = os.environ["IMAP_USER"]
+IMAP_PASSWORD    = os.environ["IMAP_PASSWORD"]
+ANTHROPIC_KEY    = os.environ["ANTHROPIC_API_KEY"]
+SUPABASE_URL     = os.environ["SUPABASE_URL"].rstrip("/")
+SUPABASE_KEY     = os.environ["SUPABASE_KEY"]
+PORTAL_ORIGIN    = os.environ.get("PORTAL_ORIGIN", "*")
+
+MAX_EMAILS_PER_SCAN = 25  # cap to keep API costs predictable per scan
+CLASSIFY_MODEL = "claude-haiku-4-5-20251001"
+
+app = Flask(__name__)
+CORS(app, origins=[PORTAL_ORIGIN] if PORTAL_ORIGIN != "*" else "*")
+anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+
+
+# -----------------------------------------------------------------------------
+# Supabase helpers (we use the REST API directly, no SDK needed)
+# -----------------------------------------------------------------------------
+def _sb_headers():
+    return {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+
+
+def sb_select(table, params=None):
+    r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/{table}",
+        headers=_sb_headers(),
+        params=params or {},
+        timeout=15,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def sb_insert(table, row):
+    r = requests.post(
+        f"{SUPABASE_URL}/rest/v1/{table}",
+        headers=_sb_headers(),
+        json=row,
+        timeout=15,
+    )
+    if r.status_code == 409:  # unique violation — already exists, skip silently
+        return None
+    r.raise_for_status()
+    data = r.json()
+    return data[0] if isinstance(data, list) and data else data
+
+
+def sb_update(table, match_col, match_val, updates):
+    r = requests.patch(
+        f"{SUPABASE_URL}/rest/v1/{table}",
+        headers=_sb_headers(),
+        params={match_col: f"eq.{match_val}"},
+        json=updates,
+        timeout=15,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def get_last_scan():
+    rows = sb_select("agent_state", {"key": "eq.last_email_scan", "select": "value"})
+    if rows and rows[0].get("value"):
+        return rows[0]["value"]
+    return None
+
+
+def set_last_scan(iso):
+    sb_update("agent_state", "key", "last_email_scan",
+              {"value": iso, "updated_at": datetime.now(timezone.utc).isoformat()})
+
+
+def contact_exists(email_addr):
+    if not email_addr:
+        return False
+    rows = sb_select("contacts", {"email": f"eq.{email_addr}", "select": "id"})
+    return len(rows) > 0
+
+
+def enquiry_exists(message_id):
+    rows = sb_select("enquiries", {"outlook_message_id": f"eq.{message_id}", "select": "id"})
+    return len(rows) > 0
+
+
+# -----------------------------------------------------------------------------
+# IMAP — fetch emails
+# -----------------------------------------------------------------------------
+def decode_value(raw):
+    if not raw:
+        return ""
+    parts = decode_header(raw)
+    out = []
+    for text, enc in parts:
+        if isinstance(text, bytes):
+            try:
+                out.append(text.decode(enc or "utf-8", errors="replace"))
+            except LookupError:
+                out.append(text.decode("utf-8", errors="replace"))
+        else:
+            out.append(text)
+    return "".join(out)
+
+
+def extract_body(msg):
+    """Get a plain-text body, falling back to stripping HTML."""
+    if msg.is_multipart():
+        for part in msg.walk():
+            ctype = part.get_content_type()
+            disp = str(part.get("Content-Disposition") or "")
+            if ctype == "text/plain" and "attachment" not in disp:
+                try:
+                    return part.get_payload(decode=True).decode(
+                        part.get_content_charset() or "utf-8", errors="replace"
+                    )
+                except Exception:
+                    continue
+        # fallback to HTML
+        for part in msg.walk():
+            if part.get_content_type() == "text/html":
+                try:
+                    html = part.get_payload(decode=True).decode(
+                        part.get_content_charset() or "utf-8", errors="replace"
+                    )
+                    return strip_html(html)
+                except Exception:
+                    continue
+        return ""
+    else:
+        try:
+            payload = msg.get_payload(decode=True)
+            text = payload.decode(msg.get_content_charset() or "utf-8", errors="replace")
+            if msg.get_content_type() == "text/html":
+                text = strip_html(text)
+            return text
+        except Exception:
+            return ""
+
+
+def strip_html(html):
+    import re
+    text = re.sub(r"<style[\s\S]*?</style>", " ", html, flags=re.I)
+    text = re.sub(r"<script[\s\S]*?</script>", " ", text, flags=re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def fetch_emails_since(since_iso):
+    """Return list of dicts: {message_id, from_addr, from_name, subject, body, received}."""
+    mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
+    mail.login(IMAP_USER, IMAP_PASSWORD)
+    mail.select("INBOX")
+
+    if since_iso:
+        since_dt = datetime.fromisoformat(since_iso.replace("Z", "+00:00"))
+        since_str = since_dt.strftime("%d-%b-%Y")
+        status, data = mail.search(None, f'(SINCE "{since_str}")')
+    else:
+        status, data = mail.search(None, "ALL")
+
+    if status != "OK":
+        mail.logout()
+        return []
+
+    ids = data[0].split()
+    # Most recent first; cap how many we look at
+    ids = list(reversed(ids))[:MAX_EMAILS_PER_SCAN]
+
+    emails = []
+    cutoff_dt = None
+    if since_iso:
+        cutoff_dt = datetime.fromisoformat(since_iso.replace("Z", "+00:00"))
+
+    for msg_id in ids:
+        status, msg_data = mail.fetch(msg_id, "(RFC822)")
+        if status != "OK":
+            continue
+        raw = msg_data[0][1]
+        msg = email.message_from_bytes(raw)
+
+        # IMAP SINCE is date-only, so filter again with the precise time
+        received_raw = msg.get("Date")
+        try:
+            received_dt = parsedate_to_datetime(received_raw)
+        except Exception:
+            received_dt = datetime.now(timezone.utc)
+        if received_dt.tzinfo is None:
+            received_dt = received_dt.replace(tzinfo=timezone.utc)
+        if cutoff_dt and received_dt <= cutoff_dt:
+            continue
+
+        message_id_hdr = msg.get("Message-ID") or msg.get("Message-Id") or f"no-id-{msg_id.decode()}"
+        from_hdr = decode_value(msg.get("From", ""))
+        subject  = decode_value(msg.get("Subject", ""))
+        body     = extract_body(msg)
+
+        # Parse "Name <addr@example.com>"
+        from_name, from_addr = email.utils.parseaddr(from_hdr)
+
+        emails.append({
+            "message_id":  message_id_hdr.strip(),
+            "from_addr":   from_addr.lower().strip(),
+            "from_name":   decode_value(from_name).strip(),
+            "subject":     subject.strip(),
+            "body":        body[:4000],   # cap body length for token costs
+            "received":    received_dt.isoformat(),
+        })
+
+    mail.logout()
+    return emails
+
+
+# -----------------------------------------------------------------------------
+# Claude classification
+# -----------------------------------------------------------------------------
+CLASSIFY_PROMPT = """You classify inbound business emails for Schofield Construction, a UK groundworks/construction business that also provides health & safety compliance documentation. The owner takes on both project work (builds, refurbs, civils, paving, fencing) and freelance/contract roles (PM, QS, site management, day-rate cover).
+
+Return ONLY valid JSON (no markdown fences, no prose) matching this shape exactly:
+
+{
+  "is_enquiry": boolean,
+  "type": "project" | "freelance" | null,
+  "priority": "hot" | "warm" | "cold" | null,
+  "estimated_value_gbp": number | null,
+  "summary": string,
+  "from_name": string,
+  "company": string
+}
+
+Rules:
+- is_enquiry=true ONLY when the sender is asking about work, a quote, a contract role, a job opportunity, or a project. Newsletters, marketing emails, receipts, internal admin, personal mail, automated notifications, and HMRC/bank/insurance mail are NOT enquiries.
+- type="project" for construction project work (builds, refurbs, civils, groundworks, paving, fencing, JV opportunities). type="freelance" for contract roles, day-rate work, recruiter approaches, PM/QS/site manager cover.
+- priority="hot" if explicitly urgent, named decision-maker, or clearly high-value. "cold" if vague/exploratory/spammy. "warm" otherwise.
+- estimated_value_gbp: extract if explicitly stated; else best estimate from scope; else null. Use sensible UK construction figures.
+- summary: one sentence, under 20 words, plain English.
+- from_name and company: extract from the email signature or sender field. Use empty string if unknowable.
+
+EMAIL:
+From: {from_field}
+Subject: {subject}
+
+Body:
+{body}
+"""
+
+
+def classify_email(em):
+    prompt = CLASSIFY_PROMPT.format(
+        from_field=f"{em['from_name']} <{em['from_addr']}>",
+        subject=em["subject"],
+        body=em["body"] or "(empty body)",
+    )
+    try:
+        resp = anthropic_client.messages.create(
+            model=CLASSIFY_MODEL,
+            max_tokens=400,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = resp.content[0].text.strip()
+        # Strip any accidental code fences
+        if text.startswith("```"):
+            text = text.strip("`")
+            if text.lower().startswith("json"):
+                text = text[4:]
+            text = text.strip()
+        return json.loads(text)
+    except Exception as e:
+        app.logger.exception("Classification failed for %s: %s", em["message_id"], e)
+        return None
+
+
+# -----------------------------------------------------------------------------
+# Routes
+# -----------------------------------------------------------------------------
+@app.route("/", methods=["GET"])
+def index():
+    return "Schofield email agent — POST /scan to run."
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"ok": True, "time": datetime.now(timezone.utc).isoformat()})
+
+
+@app.route("/scan", methods=["POST", "OPTIONS"])
+def scan():
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    payload = request.get_json(silent=True) or {}
+    # Portal sends { since: ISO_string }. If absent, fall back to DB value.
+    since = payload.get("since") or get_last_scan()
+    scan_started_at = datetime.now(timezone.utc).isoformat()
+
+    try:
+        emails = fetch_emails_since(since)
+    except Exception as e:
+        app.logger.exception("IMAP fetch failed")
+        return jsonify({"error": f"Could not fetch mail: {e}"}), 500
+
+    new_enquiries = []
+    new_contacts  = []
+
+    for em in emails:
+        if enquiry_exists(em["message_id"]):
+            continue
+
+        cls = classify_email(em)
+        if not cls or not cls.get("is_enquiry"):
+            continue
+
+        # Insert enquiry
+        enq_row = {
+            "outlook_message_id": em["message_id"],
+            "received_date": em["received"],
+            "from_name":  cls.get("from_name") or em["from_name"],
+            "from_email": em["from_addr"],
+            "company":    cls.get("company") or "",
+            "subject":    em["subject"],
+            "summary":    cls.get("summary") or "",
+            "type":       cls.get("type"),
+            "stage":      "lead",
+            "estimated_value": cls.get("estimated_value_gbp") or 0,
+            "priority":   cls.get("priority") or "warm",
+        }
+        inserted = sb_insert("enquiries", enq_row)
+        if not inserted:
+            continue  # dedupe
+
+        # Portal-shape row for the immediate response
+        new_enquiries.append({
+            "date":     em["received"][:16].replace("T", " "),
+            "from":     enq_row["from_name"],
+            "company":  enq_row["company"],
+            "subject":  enq_row["subject"],
+            "type":     enq_row["type"] or "project",
+            "stage":    enq_row["stage"],
+            "value":    enq_row["estimated_value"],
+            "priority": enq_row["priority"],
+        })
+
+        # Insert contact if new
+        if em["from_addr"] and not contact_exists(em["from_addr"]):
+            contact_row = {
+                "name":    cls.get("from_name") or em["from_name"] or em["from_addr"],
+                "company": cls.get("company") or "",
+                "email":   em["from_addr"],
+                "phone":   "",
+            }
+            c_inserted = sb_insert("contacts", contact_row)
+            if c_inserted:
+                new_contacts.append({
+                    "name":    contact_row["name"],
+                    "company": contact_row["company"],
+                    "email":   contact_row["email"],
+                    "phone":   contact_row["phone"],
+                })
+
+    # Advance the cursor — even if zero new enquiries, we don't want to re-scan these
+    set_last_scan(scan_started_at)
+
+    return jsonify({
+        "enquiries":       new_enquiries,
+        "contacts":        new_contacts,
+        "scanCompletedAt": scan_started_at,
+        "scannedCount":    len(emails),
+    })
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "8000"))
+    app.run(host="0.0.0.0", port=port)
