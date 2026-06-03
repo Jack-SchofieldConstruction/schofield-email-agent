@@ -421,6 +421,241 @@ def health():
     return jsonify({"ok": True, "time": datetime.now(timezone.utc).isoformat()})
 
 
+def rams_exists(message_id):
+    rows = sb_select("rams_submissions", {"outlook_message_id": f"eq.{message_id}", "select": "id"})
+    return len(rows) > 0
+
+
+# Common Sent folder names in IMAP — Hostinger uses "Sent", but some servers use "INBOX.Sent" etc.
+SENT_FOLDER_CANDIDATES = ['"Sent"', '"INBOX.Sent"', '"Sent Items"', '"Sent Messages"']
+
+
+def fetch_rams_emails():
+    """Walk the Sent folder for RAMS Generator notifications.
+
+    Identifies them by subject line starting with 'Your RAMS' (with optional em-dash variants).
+    Memory-efficient: streams Message-IDs, skips already-processed ones cheaply.
+    """
+    mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
+    mail.login(IMAP_USER, IMAP_PASSWORD)
+
+    # Find the Sent folder — name varies by server
+    selected_folder = None
+    for candidate in SENT_FOLDER_CANDIDATES:
+        status, _ = mail.select(candidate, readonly=True)
+        if status == "OK":
+            selected_folder = candidate
+            break
+    if not selected_folder:
+        mail.logout()
+        raise RuntimeError("Could not find Sent folder — check IMAP folder list")
+
+    since_dt = datetime.now(timezone.utc) - timedelta(days=SCAN_DAYS_BACK)
+    since_str = since_dt.strftime("%d-%b-%Y")
+    # Filter at the IMAP level: only emails with "RAMS" in the subject within our window
+    status, data = mail.search(None, f'(SINCE "{since_str}" SUBJECT "RAMS")')
+    if status != "OK":
+        mail.logout()
+        return [], 0
+
+    all_ids = list(reversed(data[0].split()))  # newest first
+    rams_emails = []
+    seen_count = 0
+
+    for msg_id in all_ids:
+        if len(rams_emails) >= MAX_EMAILS_PER_SCAN:
+            break
+
+        # Cheap header-only fetch for dedup
+        status, header_data = mail.fetch(msg_id, "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID SUBJECT)])")
+        if status != "OK":
+            continue
+        header_blob = header_data[0][1].decode("utf-8", errors="replace")
+        msg_id_match = ""
+        subject_match = ""
+        for line in header_blob.splitlines():
+            low = line.lower()
+            if low.startswith("message-id:"):
+                msg_id_match = line.split(":", 1)[1].strip()
+            elif low.startswith("subject:"):
+                subject_match = line.split(":", 1)[1].strip()
+        if not msg_id_match:
+            msg_id_match = f"no-id-{msg_id.decode()}"
+
+        # Sanity check the subject — must start with "Your RAMS"
+        if not subject_match.lower().startswith("your rams"):
+            continue
+
+        if rams_exists(msg_id_match):
+            seen_count += 1
+            continue
+
+        # Full fetch — we need To: header, body, and attachment names
+        status, msg_data = mail.fetch(msg_id, "(BODY.PEEK[])")
+        if status != "OK":
+            continue
+        raw = msg_data[0][1]
+        msg = email.message_from_bytes(raw)
+
+        received_raw = msg.get("Date")
+        try:
+            received_dt = parsedate_to_datetime(received_raw)
+        except Exception:
+            received_dt = datetime.now(timezone.utc)
+        if received_dt.tzinfo is None:
+            received_dt = received_dt.replace(tzinfo=timezone.utc)
+
+        subject = decode_value(msg.get("Subject", "")).strip()
+        to_hdr  = decode_value(msg.get("To", "")).strip()
+        # 'To' can be "Name <email@example.com>" or just an address
+        contractor_name, contractor_email = email.utils.parseaddr(to_hdr)
+        contractor_name = decode_value(contractor_name).strip()
+        contractor_email = contractor_email.lower().strip()
+
+        # Attachment filename + body text
+        attachment_filename = ""
+        body_text = ""
+        if msg.is_multipart():
+            for part in msg.walk():
+                disp = str(part.get("Content-Disposition") or "")
+                if "attachment" in disp.lower():
+                    fname = part.get_filename()
+                    if fname:
+                        attachment_filename = decode_value(fname).strip()
+                elif part.get_content_type() == "text/plain" and "attachment" not in disp.lower():
+                    try:
+                        body_text += part.get_payload(decode=True).decode(
+                            part.get_content_charset() or "utf-8", errors="replace"
+                        )
+                    except Exception:
+                        pass
+                elif part.get_content_type() == "text/html" and not body_text and "attachment" not in disp.lower():
+                    try:
+                        html = part.get_payload(decode=True).decode(
+                            part.get_content_charset() or "utf-8", errors="replace"
+                        )
+                        body_text = strip_html(html)
+                    except Exception:
+                        pass
+
+        rams_emails.append({
+            "message_id":          msg_id_match,
+            "received":            received_dt.isoformat(),
+            "subject":             subject,
+            "contractor_email":    contractor_email,
+            "contractor_name":     contractor_name,
+            "attachment_filename": attachment_filename,
+            "body_text":           body_text[:2000],
+        })
+
+        del msg, raw, msg_data
+
+    mail.logout()
+    return rams_emails, seen_count
+
+
+def parse_rams_email(em):
+    """Pull project name and hazards count out of a RAMS notification email."""
+    subject = em["subject"]
+
+    # Project name: subject is "Your RAMS — <project>" with various dash characters
+    project = ""
+    for sep in ["—", "–", "-"]:  # em-dash, en-dash, hyphen
+        if sep in subject:
+            after = subject.split(sep, 1)[1].strip()
+            if after:
+                project = after
+                break
+    if not project:
+        # Fallback: strip "Your RAMS" prefix
+        project = subject.replace("Your RAMS", "", 1).strip().lstrip("—–-:").strip()
+
+    # Hazards count: e.g. "12 identified hazards" in the body
+    hazards = None
+    import re
+    m = re.search(r"(\d+)\s+identified\s+hazards", em["body_text"] or "", re.IGNORECASE)
+    if m:
+        try:
+            hazards = int(m.group(1))
+        except ValueError:
+            pass
+
+    return {
+        "project_name": project,
+        "hazards_count": hazards,
+    }
+
+
+@app.route("/scan-rams", methods=["POST", "OPTIONS"])
+def scan_rams():
+    """Scan the Sent folder for RAMS Generator notifications and write to rams_submissions."""
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    scan_started_at = datetime.now(timezone.utc).isoformat()
+
+    try:
+        emails, skipped = fetch_rams_emails()
+    except Exception as e:
+        app.logger.exception("RAMS scan failed")
+        return jsonify({"error": f"RAMS scan failed: {e}"}), 500
+
+    new_rams = []
+    for em in emails:
+        parsed = parse_rams_email(em)
+        row = {
+            "outlook_message_id":  em["message_id"],
+            "date_sent":           em["received"],
+            "contractor_email":    em["contractor_email"],
+            "contractor_name":     em["contractor_name"] or "",
+            "project_name":        parsed["project_name"],
+            "attachment_filename": em["attachment_filename"],
+            "hazards_count":       parsed["hazards_count"],
+        }
+        inserted = sb_insert("rams_submissions", row)
+        if inserted:
+            new_rams.append({
+                "date":                em["received"][:16].replace("T", " "),
+                "contractor_email":    row["contractor_email"],
+                "contractor_name":     row["contractor_name"],
+                "project_name":        row["project_name"],
+                "attachment_filename": row["attachment_filename"],
+                "hazards_count":       row["hazards_count"],
+            })
+
+    more = len(emails) >= MAX_EMAILS_PER_SCAN
+    return jsonify({
+        "rams":              new_rams,
+        "scanCompletedAt":   scan_started_at,
+        "scannedCount":      len(emails),
+        "skippedDuplicates": skipped,
+        "moreAvailable":     more,
+    })
+
+
+@app.route("/rams", methods=["GET", "OPTIONS"])
+def list_rams():
+    """Return all RAMS submissions from the database, newest first."""
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    rows = sb_select("rams_submissions", {
+        "select": "date_sent,contractor_email,contractor_name,project_name,attachment_filename,hazards_count,id",
+        "order": "date_sent.desc",
+        "limit": "500",
+    })
+    portal_rows = [{
+        "id":                  r.get("id"),
+        "date":                (r.get("date_sent") or "")[:16].replace("T", " "),
+        "contractor_email":    r.get("contractor_email") or "",
+        "contractor_name":     r.get("contractor_name") or "",
+        "project_name":        r.get("project_name") or "",
+        "attachment_filename": r.get("attachment_filename") or "",
+        "hazards_count":       r.get("hazards_count"),
+    } for r in rows]
+    return jsonify({"count": len(portal_rows), "rams": portal_rows})
+
+
 @app.route("/enquiries", methods=["GET", "OPTIONS"])
 def list_enquiries():
     """Return all enquiries from the database, newest first, in the portal's expected shape."""
