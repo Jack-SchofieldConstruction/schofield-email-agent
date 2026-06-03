@@ -44,7 +44,7 @@ SUPABASE_URL     = os.environ["SUPABASE_URL"].rstrip("/")
 SUPABASE_KEY     = os.environ["SUPABASE_KEY"]
 PORTAL_ORIGIN    = os.environ.get("PORTAL_ORIGIN", "*")
 
-MAX_EMAILS_PER_SCAN = 200  # cap to keep one scan bounded; dedup means re-scans are cheap
+MAX_EMAILS_PER_SCAN = int(os.environ.get("MAX_EMAILS_PER_SCAN", "20"))  # per HTTP call, keeps memory low
 SCAN_DAYS_BACK = int(os.environ.get("SCAN_DAYS_BACK", "90"))
 CLASSIFY_MODEL = "claude-haiku-4-5-20251001"
 
@@ -209,31 +209,50 @@ def strip_html(html):
 
 
 def fetch_recent_emails():
-    """Fetch all emails from INBOX received in the last SCAN_DAYS_BACK days.
+    """Fetch up to MAX_EMAILS_PER_SCAN UNSEEN-BY-AGENT emails from INBOX in the last SCAN_DAYS_BACK days.
 
-    Dedup happens later via Message-ID lookup against Supabase, so re-running this
-    repeatedly is cheap — only never-seen emails get sent to Claude for classification.
-    BODY.PEEK ensures we don't change the read/unread state.
+    Walks newest-to-oldest. For each candidate, checks Supabase to see if it's already been
+    classified, and only fetches the FULL body for emails that need processing.
+    This keeps memory bounded — we never load 200 full email bodies at once.
     """
     mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
     mail.login(IMAP_USER, IMAP_PASSWORD)
     mail.select("INBOX")
 
-    # IMAP SINCE wants a date like "01-Jan-2026" — gives us all emails ON or AFTER that day.
     since_dt = datetime.now(timezone.utc) - timedelta(days=SCAN_DAYS_BACK)
     since_str = since_dt.strftime("%d-%b-%Y")
     status, data = mail.search(None, f'(SINCE "{since_str}")')
     if status != "OK":
         mail.logout()
-        return []
+        return [], 0
 
-    ids = data[0].split()
-    # Newest first; cap how many we look at in a single scan
-    ids = list(reversed(ids))[:MAX_EMAILS_PER_SCAN]
-
+    all_ids = list(reversed(data[0].split()))  # newest first
     emails = []
-    for msg_id in ids:
-        # PEEK so we don't mark as read
+    seen_count = 0
+
+    for msg_id in all_ids:
+        if len(emails) >= MAX_EMAILS_PER_SCAN:
+            break
+
+        # Step 1: fetch JUST the Message-ID header to check dedup cheaply (no body, low memory)
+        status, header_data = mail.fetch(msg_id, "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])")
+        if status != "OK":
+            continue
+        header_blob = header_data[0][1].decode("utf-8", errors="replace")
+        msg_id_match = ""
+        for line in header_blob.splitlines():
+            if line.lower().startswith("message-id:"):
+                msg_id_match = line.split(":", 1)[1].strip()
+                break
+        if not msg_id_match:
+            msg_id_match = f"no-id-{msg_id.decode()}"
+
+        # Step 2: skip if already in DB (enquiry or classification)
+        if enquiry_exists(msg_id_match) or classification_exists(msg_id_match):
+            seen_count += 1
+            continue
+
+        # Step 3: full fetch only for emails we'll actually process
         status, msg_data = mail.fetch(msg_id, "(BODY.PEEK[])")
         if status != "OK":
             continue
@@ -248,22 +267,25 @@ def fetch_recent_emails():
         if received_dt.tzinfo is None:
             received_dt = received_dt.replace(tzinfo=timezone.utc)
 
-        message_id_hdr = msg.get("Message-ID") or msg.get("Message-Id") or f"no-id-{msg_id.decode()}"
         from_hdr = decode_value(msg.get("From", ""))
         subject  = decode_value(msg.get("Subject", ""))
+        body     = extract_body(msg)[:4000]
+        from_name, from_addr = email.utils.parseaddr(from_hdr)
 
         emails.append({
-            "message_id":  message_id_hdr.strip(),
-            "from_addr":   "",      # filled in later if we proceed past dedup
-            "from_name":   "",
-            "from_hdr":    from_hdr,
+            "message_id":  msg_id_match,
+            "from_addr":   from_addr.lower().strip(),
+            "from_name":   decode_value(from_name).strip(),
             "subject":     subject.strip(),
-            "msg":         msg,     # keep the parsed message so we only extract the body if needed
+            "body":        body,
             "received":    received_dt.isoformat(),
         })
 
+        # Free the raw msg object before next loop
+        del msg, raw, msg_data
+
     mail.logout()
-    return emails
+    return emails, seen_count
 
 
 # -----------------------------------------------------------------------------
@@ -445,40 +467,21 @@ def scan():
     scan_started_at = datetime.now(timezone.utc).isoformat()
 
     try:
-        emails = fetch_recent_emails()
+        emails, skipped_dupes = fetch_recent_emails()
     except Exception as e:
         app.logger.exception("IMAP fetch failed")
         return jsonify({"error": f"Could not fetch mail: {e}"}), 500
 
     new_enquiries = []
     new_contacts  = []
-    skipped_dupes = 0
     classified    = 0
     rejections    = 0
     parse_errors  = 0
 
     for em in emails:
-        # Cheap path: skip anything already in the DB BEFORE parsing body or calling Claude
-        if enquiry_exists(em["message_id"]):
-            skipped_dupes += 1
-            continue
-        if classification_exists(em["message_id"]):
-            # Already classified once (as a non-enquiry) — don't re-spend tokens on it
-            skipped_dupes += 1
-            continue
-
-        # Only now do the expensive body extraction and parsing
-        msg = em.pop("msg")
-        body = extract_body(msg)[:4000]
-        from_name, from_addr = email.utils.parseaddr(em["from_hdr"])
-        em["from_addr"] = from_addr.lower().strip()
-        em["from_name"] = decode_value(from_name).strip()
-        em["body"]      = body
-
         cls, raw_text = classify_email(em)
         classified += 1
 
-        # Always log the classification result, enquiry or not
         log_row = {
             "outlook_message_id": em["message_id"],
             "received_date": em["received"],
@@ -498,7 +501,7 @@ def scan():
                 "reason":     cls.get("reason") or "",
             })
         else:
-            log_row.update({"is_enquiry": False, "reason": "JSON parse error — see raw_response"})
+            log_row.update({"is_enquiry": False, "reason": "Classification failed — see raw_response"})
             parse_errors += 1
         sb_insert("classifications", log_row)
 
@@ -556,6 +559,9 @@ def scan():
 
     set_last_scan(scan_started_at)
 
+    # Signal to the portal whether there's likely more to process
+    more_available = classified >= MAX_EMAILS_PER_SCAN
+
     return jsonify({
         "enquiries":         new_enquiries,
         "contacts":          new_contacts,
@@ -565,6 +571,8 @@ def scan():
         "skippedDuplicates": skipped_dupes,
         "rejections":        rejections,
         "parseErrors":       parse_errors,
+        "moreAvailable":     more_available,
+        "batchSize":         MAX_EMAILS_PER_SCAN,
     })
 
 
