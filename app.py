@@ -294,16 +294,23 @@ Classification rules:
 
 is_enquiry = TRUE when:
 - A recruiter is offering Jack a specific contract/freelance role (Site Manager, Project Manager, QS, or similar construction freelance work). Even if generic/cold, treat as TRUE.
+- A job board alert (Indeed, Hampshire Jobs, LinkedIn, CV-Library, etc.) features a SPECIFIC role for SM, PM, QS, or similar construction freelance/contract work with identifiable details (employer, location, rate, or role title). These ARE legitimate leads even though they're automated — Jack actively looks at job boards for these.
+- Remote, hybrid, or flexible-location SM/PM/QS roles — treat as INTERESTING regardless of geography.
 - Someone is asking about project work for Schofield Construction (quotes, builds, civils, groundworks).
 - Someone is offering a day-rate or short-term contract opportunity.
 - Anyone asking about Jack's availability for site management, project management, or QS work.
 
 is_enquiry = FALSE when:
-- Newsletters, marketing blasts, industry news, job-board digests (e.g. "10 new jobs matching your search").
-- Receipts, invoices, billing, HMRC, banks, insurance.
-- Automated notifications (LinkedIn updates, software notifications, calendar invites).
+- A job board email that is just a GENERIC weekly digest with no specific roles, OR contains only roles outside construction (tech, retail, healthcare, etc.).
+- Marketing/newsletter content from tool vendors, software companies, industry publications.
+- Receipts, invoices, billing, HMRC, banks, insurance, utilities.
+- Automated system notifications (LinkedIn connection updates, calendar invites, password resets).
 - Personal mail, internal admin, replies to existing threads from known contacts already in Jack's pipeline.
-- Recruiter spam that is NOT for construction freelance roles (e.g. tech jobs, sales jobs, anything outside SM/PM/QS/site work).
+- Recruiter spam that is NOT for construction freelance roles (e.g. tech jobs, sales jobs, anything outside SM/PM/QS/site/construction).
+
+Edge cases — favour TRUE when:
+- The email lists 1-3 specific construction roles even if framed as "alert" or "digest" — extract the most relevant one in `summary`.
+- The role mentions "freelance", "contract", "day rate", or specific £/day figures — these are strong positive signals.
 
 type:
 - "freelance" — contract or day-rate role for Jack personally (SM, PM, QS, site cover, etc.). This is the MAJORITY case.
@@ -369,10 +376,14 @@ def classify_email(em):
     except json.JSONDecodeError as e:
         app.logger.warning("Could not parse Claude JSON for %s: %s — raw: %s",
                            em["message_id"], e, raw_text[:300])
-        return None, raw_text
+        return None, f"[JSON_DECODE_ERROR] {e}\n---RAW---\n{raw_text}"
     except Exception as e:
-        app.logger.exception("Classification failed for %s: %s", em["message_id"], e)
-        return None, raw_text
+        # Capture the actual exception so we can see what's going wrong (auth, rate limit, etc.)
+        err_type = type(e).__name__
+        err_msg = str(e)
+        app.logger.exception("Classification failed for %s: %s: %s",
+                             em["message_id"], err_type, err_msg)
+        return None, f"[{err_type}] {err_msg}\n---RAW---\n{raw_text}"
 
 
 # -----------------------------------------------------------------------------
