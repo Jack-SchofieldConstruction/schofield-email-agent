@@ -421,6 +421,48 @@ def health():
     return jsonify({"ok": True, "time": datetime.now(timezone.utc).isoformat()})
 
 
+@app.route("/enquiries", methods=["GET", "OPTIONS"])
+def list_enquiries():
+    """Return all enquiries from the database, newest first, in the portal's expected shape."""
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    rows = sb_select("enquiries", {
+        "select": "received_date,from_name,from_email,company,subject,summary,type,role,stage,estimated_value,priority,id",
+        "order": "received_date.desc",
+        "limit": "500",
+    })
+    portal_rows = [{
+        "id":       r.get("id"),
+        "date":     (r.get("received_date") or "")[:16].replace("T", " "),
+        "from":     r.get("from_name") or "",
+        "email":    r.get("from_email") or "",
+        "company":  r.get("company") or "",
+        "subject":  r.get("subject") or "",
+        "summary":  r.get("summary") or "",
+        "type":     r.get("type") or "freelance",
+        "role":     r.get("role"),
+        "stage":    r.get("stage") or "lead",
+        "value":    r.get("estimated_value") or 0,
+        "priority": r.get("priority") or "warm",
+    } for r in rows]
+    return jsonify({"count": len(portal_rows), "enquiries": portal_rows})
+
+
+@app.route("/contacts", methods=["GET", "OPTIONS"])
+def list_contacts():
+    """Return all contacts from the database, newest first."""
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    rows = sb_select("contacts", {
+        "select": "name,company,email,phone,id",
+        "order": "created_at.desc",
+        "limit": "500",
+    })
+    return jsonify({"count": len(rows), "contacts": rows})
+
+
 @app.route("/recent-rejections", methods=["GET"])
 def recent_rejections():
     """Return the most recent emails classified as NOT enquiries, with Claude's reason.
