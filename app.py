@@ -140,6 +140,11 @@ def enquiry_exists(message_id):
     return len(rows) > 0
 
 
+def classification_exists(message_id):
+    rows = sb_select("classifications", {"outlook_message_id": f"eq.{message_id}", "select": "id"})
+    return len(rows) > 0
+
+
 # -----------------------------------------------------------------------------
 # IMAP — fetch emails
 # -----------------------------------------------------------------------------
@@ -281,7 +286,8 @@ Return ONLY valid JSON (no markdown fences, no prose) matching this shape exactl
   "estimated_value_gbp": number | null,
   "summary": string,
   "from_name": string,
-  "company": string
+  "company": string,
+  "reason": string
 }
 
 Classification rules:
@@ -324,6 +330,13 @@ summary: one sentence, under 20 words, plain English. State the role/type and ke
 
 from_name and company: extract from signature or sender. Empty string if unknowable.
 
+reason: ALWAYS provide a one-sentence (under 25 words) explanation of WHY you classified this as an enquiry or not. Be specific — name what triggered the decision. Examples:
+- "Recruiter offering 12-week SM contract in Reading at £450/day."
+- "LinkedIn weekly digest of unrelated job suggestions, not a specific role offer."
+- "Marketing newsletter from a tool vendor, no role or project on offer."
+- "Receipt from Hostinger billing — automated, no opportunity."
+- "Reply from existing contractor about ongoing project — internal thread."
+
 EMAIL:
 From: __FROM_FIELD__
 Subject: __SUBJECT__
@@ -338,23 +351,28 @@ def classify_email(em):
               .replace("__FROM_FIELD__", f"{em['from_name']} <{em['from_addr']}>")
               .replace("__SUBJECT__", em["subject"])
               .replace("__BODY__", em["body"] or "(empty body)"))
+    raw_text = ""
     try:
         resp = anthropic_client.messages.create(
             model=CLASSIFY_MODEL,
-            max_tokens=400,
+            max_tokens=500,
             messages=[{"role": "user", "content": prompt}],
         )
-        text = resp.content[0].text.strip()
-        # Strip any accidental code fences
+        raw_text = resp.content[0].text.strip()
+        text = raw_text
         if text.startswith("```"):
             text = text.strip("`")
             if text.lower().startswith("json"):
                 text = text[4:]
             text = text.strip()
-        return json.loads(text)
+        return json.loads(text), raw_text
+    except json.JSONDecodeError as e:
+        app.logger.warning("Could not parse Claude JSON for %s: %s — raw: %s",
+                           em["message_id"], e, raw_text[:300])
+        return None, raw_text
     except Exception as e:
         app.logger.exception("Classification failed for %s: %s", em["message_id"], e)
-        return None
+        return None, raw_text
 
 
 # -----------------------------------------------------------------------------
@@ -368,6 +386,44 @@ def index():
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"ok": True, "time": datetime.now(timezone.utc).isoformat()})
+
+
+@app.route("/recent-rejections", methods=["GET"])
+def recent_rejections():
+    """Return the most recent emails classified as NOT enquiries, with Claude's reason.
+       Optional query params:
+         ?limit=50    (default 50)
+         ?search=foo  filter subject/from
+    """
+    limit = int(request.args.get("limit", "50"))
+    search = request.args.get("search", "").strip()
+
+    params = {
+        "is_enquiry": "eq.false",
+        "select": "received_date,from_name,from_email,subject,reason,raw_response,created_at",
+        "order": "created_at.desc",
+        "limit": str(limit),
+    }
+    if search:
+        # Postgrest 'or' filter — match search in subject OR from_name OR from_email
+        params["or"] = f"(subject.ilike.*{search}*,from_name.ilike.*{search}*,from_email.ilike.*{search}*)"
+
+    rows = sb_select("classifications", params)
+    return jsonify({"count": len(rows), "rejections": rows})
+
+
+@app.route("/recent-classifications", methods=["GET"])
+def recent_classifications():
+    """All recent classifications, enquiries AND rejections, for browsing.
+       Optional ?limit=50
+    """
+    limit = int(request.args.get("limit", "50"))
+    rows = sb_select("classifications", {
+        "select": "received_date,from_name,from_email,subject,is_enquiry,type,role,priority,summary,reason,created_at",
+        "order": "created_at.desc",
+        "limit": str(limit),
+    })
+    return jsonify({"count": len(rows), "results": rows})
 
 
 @app.route("/scan", methods=["POST", "OPTIONS"])
@@ -387,10 +443,16 @@ def scan():
     new_contacts  = []
     skipped_dupes = 0
     classified    = 0
+    rejections    = 0
+    parse_errors  = 0
 
     for em in emails:
         # Cheap path: skip anything already in the DB BEFORE parsing body or calling Claude
         if enquiry_exists(em["message_id"]):
+            skipped_dupes += 1
+            continue
+        if classification_exists(em["message_id"]):
+            # Already classified once (as a non-enquiry) — don't re-spend tokens on it
             skipped_dupes += 1
             continue
 
@@ -402,9 +464,35 @@ def scan():
         em["from_name"] = decode_value(from_name).strip()
         em["body"]      = body
 
-        cls = classify_email(em)
+        cls, raw_text = classify_email(em)
         classified += 1
+
+        # Always log the classification result, enquiry or not
+        log_row = {
+            "outlook_message_id": em["message_id"],
+            "received_date": em["received"],
+            "from_name":  em["from_name"],
+            "from_email": em["from_addr"],
+            "subject":    em["subject"],
+            "raw_response": raw_text[:2000] if raw_text else None,
+        }
+        if cls:
+            log_row.update({
+                "is_enquiry": bool(cls.get("is_enquiry")),
+                "type":       cls.get("type"),
+                "role":       cls.get("role"),
+                "priority":   cls.get("priority"),
+                "estimated_value": cls.get("estimated_value_gbp") or 0,
+                "summary":    cls.get("summary") or "",
+                "reason":     cls.get("reason") or "",
+            })
+        else:
+            log_row.update({"is_enquiry": False, "reason": "JSON parse error — see raw_response"})
+            parse_errors += 1
+        sb_insert("classifications", log_row)
+
         if not cls or not cls.get("is_enquiry"):
+            rejections += 1
             continue
 
         role = cls.get("role")
@@ -458,12 +546,14 @@ def scan():
     set_last_scan(scan_started_at)
 
     return jsonify({
-        "enquiries":       new_enquiries,
-        "contacts":        new_contacts,
-        "scanCompletedAt": scan_started_at,
-        "scannedCount":    len(emails),
-        "newlyClassified": classified,
+        "enquiries":         new_enquiries,
+        "contacts":          new_contacts,
+        "scanCompletedAt":   scan_started_at,
+        "scannedCount":      len(emails),
+        "newlyClassified":   classified,
         "skippedDuplicates": skipped_dupes,
+        "rejections":        rejections,
+        "parseErrors":       parse_errors,
     })
 
 
