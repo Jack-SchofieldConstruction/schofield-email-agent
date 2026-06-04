@@ -426,8 +426,8 @@ def rams_exists(message_id):
     return len(rows) > 0
 
 
-# Common Sent folder names in IMAP — Hostinger uses "Sent", but some servers use "INBOX.Sent" etc.
-SENT_FOLDER_CANDIDATES = ['"Sent"', '"INBOX.Sent"', '"Sent Items"', '"Sent Messages"']
+# Common Sent folder names in IMAP — Hostinger uses "INBOX.Sent", others vary.
+SENT_FOLDER_CANDIDATES = ['INBOX.Sent', 'Sent', 'Sent Items', 'Sent Messages', '[Gmail]/Sent Mail']
 
 
 def fetch_rams_emails():
