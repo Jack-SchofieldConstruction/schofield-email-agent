@@ -234,18 +234,30 @@ def fetch_recent_emails():
         if len(emails) >= MAX_EMAILS_PER_SCAN:
             break
 
-        # Step 1: fetch JUST the Message-ID header to check dedup cheaply (no body, low memory)
-        status, header_data = mail.fetch(msg_id, "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])")
+        # Step 1: fetch JUST the Message-ID + Subject + From headers to check dedup AND skip RAMS cheaply
+        status, header_data = mail.fetch(msg_id, "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID SUBJECT FROM)])")
         if status != "OK":
             continue
         header_blob = header_data[0][1].decode("utf-8", errors="replace")
         msg_id_match = ""
+        subject_hdr  = ""
+        from_hdr     = ""
         for line in header_blob.splitlines():
-            if line.lower().startswith("message-id:"):
+            low = line.lower()
+            if low.startswith("message-id:"):
                 msg_id_match = line.split(":", 1)[1].strip()
-                break
+            elif low.startswith("subject:"):
+                subject_hdr = decode_value(line.split(":", 1)[1].strip())
+            elif low.startswith("from:"):
+                from_hdr = line.split(":", 1)[1].strip()
         if not msg_id_match:
             msg_id_match = f"no-id-{msg_id.decode()}"
+
+        # Skip RAMS Generator notifications — handled by a separate flow
+        if (subject_hdr.lower().lstrip().startswith("your rams")
+                and IMAP_USER.lower() in from_hdr.lower()):
+            seen_count += 1
+            continue
 
         # Step 2: skip if already in DB (enquiry or classification)
         if enquiry_exists(msg_id_match) or classification_exists(msg_id_match):
@@ -431,29 +443,23 @@ SENT_FOLDER_CANDIDATES = ['INBOX.Sent', 'Sent', 'Sent Items', 'Sent Messages', '
 
 
 def fetch_rams_emails():
-    """Walk the Sent folder for RAMS Generator notifications.
+    """Walk the INBOX for RAMS Generator notifications.
 
-    Identifies them by subject line starting with 'Your RAMS' (with optional em-dash variants).
+    The RAMS Generator sends from IMAP_USER (i.e. emails appear to come FROM yourself
+    because you Cc yourself on each one). Identifies them by:
+      - From address contains IMAP_USER
+      - Subject starts with 'Your RAMS'
     Memory-efficient: streams Message-IDs, skips already-processed ones cheaply.
     """
     mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
     mail.login(IMAP_USER, IMAP_PASSWORD)
-
-    # Find the Sent folder — name varies by server
-    selected_folder = None
-    for candidate in SENT_FOLDER_CANDIDATES:
-        status, _ = mail.select(candidate, readonly=True)
-        if status == "OK":
-            selected_folder = candidate
-            break
-    if not selected_folder:
-        mail.logout()
-        raise RuntimeError("Could not find Sent folder — check IMAP folder list")
+    mail.select("INBOX")
 
     since_dt = datetime.now(timezone.utc) - timedelta(days=SCAN_DAYS_BACK)
     since_str = since_dt.strftime("%d-%b-%Y")
-    # Filter at the IMAP level: only emails with "RAMS" in the subject within our window
-    status, data = mail.search(None, f'(SINCE "{since_str}" SUBJECT "RAMS")')
+    # Server-side filter: emails FROM ourselves with RAMS in subject
+    search_filter = f'(SINCE "{since_str}" FROM "{IMAP_USER}" SUBJECT "RAMS")'
+    status, data = mail.search(None, search_filter)
     if status != "OK":
         mail.logout()
         return [], 0
@@ -466,24 +472,28 @@ def fetch_rams_emails():
         if len(rams_emails) >= MAX_EMAILS_PER_SCAN:
             break
 
-        # Cheap header-only fetch for dedup
-        status, header_data = mail.fetch(msg_id, "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID SUBJECT)])")
+        status, header_data = mail.fetch(msg_id, "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID SUBJECT FROM)])")
         if status != "OK":
             continue
         header_blob = header_data[0][1].decode("utf-8", errors="replace")
         msg_id_match = ""
         subject_match = ""
+        from_hdr = ""
         for line in header_blob.splitlines():
             low = line.lower()
             if low.startswith("message-id:"):
                 msg_id_match = line.split(":", 1)[1].strip()
             elif low.startswith("subject:"):
-                subject_match = line.split(":", 1)[1].strip()
+                subject_match = decode_value(line.split(":", 1)[1].strip())
+            elif low.startswith("from:"):
+                from_hdr = line.split(":", 1)[1].strip()
         if not msg_id_match:
             msg_id_match = f"no-id-{msg_id.decode()}"
 
-        # Sanity check the subject — must start with "Your RAMS"
-        if not subject_match.lower().startswith("your rams"):
+        # Belt-and-braces: subject must start with "Your RAMS" and From must contain our address
+        if not subject_match.lower().lstrip().startswith("your rams"):
+            continue
+        if IMAP_USER.lower() not in from_hdr.lower():
             continue
 
         if rams_exists(msg_id_match):
@@ -507,12 +517,10 @@ def fetch_rams_emails():
 
         subject = decode_value(msg.get("Subject", "")).strip()
         to_hdr  = decode_value(msg.get("To", "")).strip()
-        # 'To' can be "Name <email@example.com>" or just an address
         contractor_name, contractor_email = email.utils.parseaddr(to_hdr)
         contractor_name = decode_value(contractor_name).strip()
         contractor_email = contractor_email.lower().strip()
 
-        # Attachment filename + body text
         attachment_filename = ""
         body_text = ""
         if msg.is_multipart():
