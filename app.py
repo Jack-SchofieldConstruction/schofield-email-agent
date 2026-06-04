@@ -602,6 +602,64 @@ def imap_folders():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/sent-subjects", methods=["GET"])
+def sent_subjects():
+    """Diagnostic: list recent Sent folder subject lines + recipient + Message-ID
+       so we can see why RAMS emails aren't matching."""
+    try:
+        mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
+        mail.login(IMAP_USER, IMAP_PASSWORD)
+
+        selected_folder = None
+        for candidate in SENT_FOLDER_CANDIDATES:
+            status, _ = mail.select(candidate, readonly=True)
+            if status == "OK":
+                selected_folder = candidate
+                break
+        if not selected_folder:
+            mail.logout()
+            return jsonify({"error": "Could not find Sent folder"}), 500
+
+        # Get ALL emails in Sent folder (not filtered by subject)
+        since_dt = datetime.now(timezone.utc) - timedelta(days=SCAN_DAYS_BACK)
+        since_str = since_dt.strftime("%d-%b-%Y")
+        status, data = mail.search(None, f'(SINCE "{since_str}")')
+        if status != "OK":
+            mail.logout()
+            return jsonify({"error": "search failed"}), 500
+
+        ids = list(reversed(data[0].split()))[:50]  # show last 50
+        results = []
+        for msg_id in ids:
+            status, header_data = mail.fetch(msg_id, "(BODY.PEEK[HEADER.FIELDS (SUBJECT TO MESSAGE-ID DATE)])")
+            if status != "OK":
+                continue
+            blob = header_data[0][1].decode("utf-8", errors="replace")
+            subject = to = mid = date = ""
+            for line in blob.splitlines():
+                low = line.lower()
+                if low.startswith("subject:"):
+                    subject = decode_value(line.split(":", 1)[1].strip())
+                elif low.startswith("to:"):
+                    to = line.split(":", 1)[1].strip()
+                elif low.startswith("message-id:"):
+                    mid = line.split(":", 1)[1].strip()
+                elif low.startswith("date:"):
+                    date = line.split(":", 1)[1].strip()
+            results.append({
+                "subject": subject,
+                "to": to,
+                "message_id": mid,
+                "date": date,
+                "starts_with_your_rams": subject.lower().lstrip().startswith("your rams"),
+            })
+
+        mail.logout()
+        return jsonify({"folder": selected_folder, "count": len(results), "emails": results})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/scan-rams", methods=["POST", "OPTIONS"])
 def scan_rams():
     """Scan the Sent folder for RAMS Generator notifications and write to rams_submissions."""
