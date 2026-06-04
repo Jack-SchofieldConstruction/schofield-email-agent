@@ -586,6 +586,22 @@ def parse_rams_email(em):
     }
 
 
+@app.route("/imap-folders", methods=["GET"])
+def imap_folders():
+    """Diagnostic: list all IMAP folders on the mailbox so we can see exact names."""
+    try:
+        mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
+        mail.login(IMAP_USER, IMAP_PASSWORD)
+        status, folders = mail.list()
+        mail.logout()
+        if status != "OK":
+            return jsonify({"error": "Could not list folders"}), 500
+        folder_names = [f.decode("utf-8", errors="replace") for f in folders]
+        return jsonify({"count": len(folder_names), "folders": folder_names})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/scan-rams", methods=["POST", "OPTIONS"])
 def scan_rams():
     """Scan the Sent folder for RAMS Generator notifications and write to rams_submissions."""
